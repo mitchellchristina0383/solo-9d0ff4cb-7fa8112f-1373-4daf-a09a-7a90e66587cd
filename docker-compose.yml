@@ -37,6 +37,8 @@ services:
       PROXY_DB: /data/proxy.db
       # 读回执超过该秒数即判定"结果不确定"，不补投；按需调小做超时演练。
       WRITER_READ_TIMEOUT: "30"
+      # 断线重试/向原节点查询（可带 wait 等慢回执）的只读查询超时。
+      QUERY_READ_TIMEOUT: "20"
       CONNECT_TIMEOUT: "3"
       PROBE_TIMEOUT: "2.5"
     volumes:

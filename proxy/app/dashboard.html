@@ -68,24 +68,40 @@
   </section>
 
   <section class="card">
-    <h2>发起写入（可在写入尚未返回期间切流）</h2>
+    <h2>发起写入（可指定写入 ID；不填则自动生成。可在写入尚未返回期间切流）</h2>
     <div class="row">
+      <input type="text" id="writeid" placeholder="写入 ID（可留空自动生成；重试时沿用同一 ID）" style="min-width:260px">
       <input type="text" id="payload" placeholder='写入内容，例如 {"order":42}，留空自动生成'>
       <label class="muted">慢回执延迟(秒) <input type="number" id="delay" value="8" min="0" step="0.5"></label>
       <button class="primary" id="send">投递写入</button>
     </div>
-    <p class="muted" style="margin:10px 0 0">提示：延迟设 8~15 秒后点投递，在返回前立刻点另一节点的"切换流量"，即可演练在途切流。</p>
+    <p class="muted" style="margin:10px 0 0">提示：延迟设 8~15 秒后点投递，在返回前立刻点另一节点的"切换流量"，即可演练在途切流；投递成功后写入 ID 会自动保留，可直接做断线重试演练。</p>
   </section>
 
   <section class="card">
-    <h2>代理侧写入记录（含排空视角：非现役节点上未回执的写入）</h2>
+    <h2>断线安全重试演练（同号同内容只核实不重投；同号异内容报冲突且不改原记录）</h2>
+    <div class="row">
+      <input type="text" id="retryid" placeholder="要重试的写入 ID（点下表"同内容重试"会自动带入）" style="min-width:260px">
+      <input type="text" id="retrypayload" placeholder="重试内容（默认沿用原内容；改成不同内容即模拟冲突）" style="min-width:260px">
+      <button class="primary" id="retrySame">同内容重试（模拟断线重发）</button>
+      <button class="danger" id="retryDiff">异内容重试（应报 409 冲突）</button>
+    </div>
+    <p class="uncertain-note" style="margin-top:12px">
+      🔁 同号同内容重试<b>不会产生第二次后端投递</b>：代理只向该写入<b>首次绑定的原节点</b>只读核实当前结论，
+      切流后、代理重启后同样如此；原节点不可达或查无记录时返回"结果不确定"，<b>绝不改投备用节点</b>。
+      同号异内容返回 409 冲突，原记录保持不变。
+    </p>
+  </section>
+
+  <section class="card">
+    <h2>代理侧写入记录（含排空视角：非现役节点上未回执的写入；投/重试/冲突计数）</h2>
     <div style="overflow:auto"><table id="writes">
-      <thead><tr><th>写入 ID</th><th>送达节点</th><th>状态</th><th>说明</th><th>时间</th><th></th></tr></thead>
+      <thead><tr><th>写入 ID</th><th>送达节点</th><th>状态</th><th>投/重试/冲突</th><th>说明</th><th>时间</th><th>操作</th></tr></thead>
       <tbody></tbody>
     </table></div>
     <p class="uncertain-note" style="margin-top:12px">
       ⚠️ <b>TIMEOUT_UNCERTAIN</b>：写入已在后端落库但回执超时，结果不确定。
-      系统<b>不会</b>自动向另一节点补投；可点"向原节点查询"核实（切流后仍查原送达节点）。
+      系统<b>不会</b>自动向另一节点补投；可点"向原节点查询"或"同内容重试"核实（切流、重启后仍查原送达节点）。
     </p>
   </section>
 
@@ -153,22 +169,60 @@ async function refreshOne(id){
     await refresh();
   }catch(e){ toast('查询失败：'+e.message, false); }
 }
+const writeMap = {};
+function fillRetryRow(id){
+  const w = writeMap[id];
+  if(!w) return;
+  $('#retryid').value = w.id;
+  $('#retrypayload').value = w.payload;
+  toast(`已带入写入 ${w.id.slice(0,8)}…（节点 ${w.target_node}，原内容已填入）`);
+}
 
 $('#send').onclick = async () => {
   const btn = $('#send'); btn.disabled = true; btn.textContent = '投递中…';
   const payload = $('#payload').value.trim() || ('auto-'+Date.now());
   const delay = parseFloat($('#delay').value) || 0;
+  const reqBody = {payload};
+  const wid = $('#writeid').value.trim();
+  if (wid) reqBody.id = wid;          // 允许业务侧指定写入 ID
   const t0 = Date.now();
   try{
     const r = await api(`/api/writes?delay=${delay}`,
-      {method:'POST', body: JSON.stringify({payload})});
+      {method:'POST', body: JSON.stringify(reqBody)});
+    // 沿用同一 ID，方便紧接着演练断线重试。
+    $('#writeid').value = r.id; $('#retryid').value = r.id;
+    $('#retrypayload').value = payload;
     toast(`写入 ${r.id} 已由节点 ${r.node} 回执（耗时 ${((Date.now()-t0)/1000).toFixed(1)}s）`);
   }catch(e){
     const d = e.data || {};
-    if(d.uncertain) toast(`⚠️ 回执超时，结果不确定（${((Date.now()-t0)/1000).toFixed(1)}s），未补投`, false);
+    if(d.uncertain) { toast(`⚠️ 回执超时，结果不确定（${((Date.now()-t0)/1000).toFixed(1)}s），未补投`, false);
+      if(d.id){ $('#writeid').value = d.id; $('#retryid').value = d.id; $('#retrypayload').value = payload; } }
     else toast('写入失败：'+e.message, false);
   }finally{ btn.disabled=false; btn.textContent='投递写入'; await refresh(); }
 };
+
+async function doRetry(samePayload){
+  const id = $('#retryid').value.trim();
+  if(!id){ toast('请先填写或选择要重试的写入 ID', false); return; }
+  const payload = samePayload
+    ? ($('#retrypayload').value.trim() || '')
+    : ($('#retrypayload').value.trim() + '-CONFLICT-' + Date.now());
+  const t0 = Date.now();
+  try{
+    const r = await api('/api/writes?wait=true',
+      {method:'POST', body: JSON.stringify({id, payload})});
+    const secs = ((Date.now()-t0)/1000).toFixed(1);
+    if(r.uncertain) toast(`⚠️ 重试未产生第二次投递；原节点 ${r.node} 暂无法确认（${secs}s）：${r.note||r.status}`, false);
+    else toast(`🔁 重试已抑制二次投递，仅向原节点 ${r.node} 核实：${r.status}（${secs}s）`);
+  }catch(e){
+    const d = e.data || {};
+    if(d.conflict) toast(`⛔ 同号异内容冲突 409：原记录（节点 ${d.node} / ${d.status}）未改动，未发生任何投递`, false);
+    else toast('重试失败：'+e.message, false);
+  }
+  await refresh();
+}
+$('#retrySame').onclick = () => doRetry(true);
+$('#retryDiff').onclick = () => doRetry(false);
 
 async function refresh(){
   let s;
@@ -200,14 +254,24 @@ async function refresh(){
     </div>`;
   }).join('');
 
-  $('#writes tbody').innerHTML = s.writes.map(w => `<tr>
-    <td class="mono">${esc(w.id.slice(0,8))}…</td>
-    <td><span class="badge ${w.target_node===s.active?'b-info':'b-mut'}">${esc(w.target_node)}</span></td>
+  Object.keys(writeMap).forEach(k => delete writeMap[k]);
+  s.writes.forEach(w => { writeMap[w.id] = w; });
+  $('#writes tbody').innerHTML = s.writes.map(w => {
+    const a = w.attempts || {};
+    const eid = encodeURIComponent(w.id);
+    return `<tr>
+    <td class="mono">${esc(w.id.slice(0,8))}…<br><span class="muted" style="font-size:11px">${esc(w.payload.slice(0,24))}${w.payload.length>24?'…':''}</span></td>
+    <td><span class="badge ${w.target_node===s.active?'b-info':'b-mut'}">${esc(w.target_node)}</span>
+        ${w.in_flight?'<br><span class="badge b-warn">在途</span>':''}</td>
     <td>${statusBadge(w.status)}</td>
-    <td class="muted" style="max-width:380px">${esc(w.status_detail)}</td>
+    <td class="mono" style="text-align:center">${a.deliveries??0} / <span class="badge b-info">${a.retries??0}</span> / ${a.conflicts??0?`<span class="badge b-bad">${a.conflicts}</span>`:'0'}</td>
+    <td class="muted" style="max-width:340px">${esc(w.status_detail)}</td>
     <td class="muted">${fmt(w.created_at)}</td>
-    <td><button onclick="refreshOne('${esc(w.id)}')">向原节点查询</button></td>
-  </tr>`).join('') || '<tr><td colspan="6" class="muted">暂无写入</td></tr>';
+    <td style="white-space:nowrap">
+      <button onclick="refreshOne('${eid}')">向原节点查询</button>
+      <button class="primary" onclick="fillRetryRow('${eid}')">带去重试</button>
+    </td>
+  </tr>`;}).join('') || '<tr><td colspan="7" class="muted">暂无写入</td></tr>';
 
   $('#events').innerHTML = s.events.map(ev => `<tr>
     <td class="muted">${fmt(ev.ts)}</td><td><span class="badge b-mut">${esc(ev.kind)}</span></td>

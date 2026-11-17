@@ -136,7 +136,14 @@ async def get_write(write_id: str, wait: bool = False) -> JSONResponse:
     """查询单条写入的回执状态。
 
     wait=true 时，如果该写入仍在慢回执中，最多等待 60 秒，供代理向原送达节点取回执。
+    故障注入期间只读接口同样 503，用于演练"原节点暂时不可达，结论不确定、不改投"。
     """
+    if _fault_on:
+        return JSONResponse(
+            status_code=503,
+            content={"node": NODE_NAME, "found": False,
+                     "error": "node in fault state, query rejected"},
+        )
     if wait and write_id in _pending:
         try:
             await asyncio.wait_for(_pending[write_id].wait(), timeout=60)
